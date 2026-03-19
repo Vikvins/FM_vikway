@@ -101,7 +101,7 @@ class SpatialIndex:
 
 
 def _candidate_export_dirs() -> list[Path]:
-    backend_dir = Path(__file__).resolve().parents[2]
+    backend_dir = Path(__file__).resolve().parents[1]
     workspace_dir = backend_dir.parent
     return [
         backend_dir / "data" / "export",
