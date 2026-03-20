@@ -520,6 +520,38 @@ def _dedupe_paths(
     return [(item["modes"], item["path"]) for item in grouped.values()]
 
 
+def _metric_delta(a: float | None, b: float | None) -> float:
+    if a is None or b is None:
+        return 0.0
+    return abs(float(a) - float(b))
+
+
+def _is_meaningfully_distinct_route(candidate: RouteInfo, existing: RouteInfo) -> bool:
+    length_delta_ratio = abs(candidate.length_m - existing.length_m) / max(existing.length_m, 1.0)
+    noise_delta = _metric_delta(candidate.avg_noise, existing.avg_noise)
+    green_delta = _metric_delta(candidate.avg_green, existing.avg_green)
+
+    return (
+        length_delta_ratio >= 0.08
+        or noise_delta >= 0.5
+        or green_delta >= 0.03
+    )
+
+
+def _filter_metric_duplicates(routes: list[RouteInfo]) -> list[RouteInfo]:
+    filtered: list[RouteInfo] = []
+
+    for route in routes:
+        if not filtered:
+            filtered.append(route)
+            continue
+
+        if any(_is_meaningfully_distinct_route(route, existing) for existing in filtered):
+            filtered.append(route)
+
+    return filtered
+
+
 def _compute_paths(
     graph: nx.Graph,
     start_node: tuple[float, float],
@@ -713,6 +745,7 @@ def build_routes(request: RouteRequest) -> RouteResponse:
         )
 
     route_infos.sort(key=lambda r: (not r.selected, r.eta_min))
+    route_infos = _filter_metric_duplicates(route_infos)
 
     snapped_start_lat, snapped_start_lon = m_to_latlon(*start_node)
     snapped_end_lat, snapped_end_lon = m_to_latlon(*end_node)
