@@ -36,9 +36,9 @@ MODE_COLORS: dict[Mode, str] = {
 
 MODE_WEIGHT_CANDIDATES: dict[Mode, list[str]] = {
     "shortest": ["w_short", "weight", "length_m"],
-    "quiet": ["w_quiet_v11", "w_quiet", "w_noise", "weight"],
-    "green": ["w_green_v11", "w_green", "weight"],
-    "balanced": ["w_balanced_v11", "w_balanced", "w_accessible", "weight", "w_short"],
+    "quiet": ["w_quiet", "w_quiet_v11", "w_noise", "weight"],
+    "green": ["w_green", "w_green_v11", "weight"],
+    "balanced": ["w_accessible", "w_balanced", "w_balanced_v11", "weight", "w_short"],
 }
 
 NOISE_ATTR_CANDIDATES = [
@@ -382,15 +382,17 @@ def _enrich_graph_with_environment(graph: nx.Graph, export_dir: Path) -> None:
         green_penalty = (1.0 - green_score) ** 2
         noise_penalty = noise_norm ** 1.15
 
-        attrs["w_short"] = length_m
-        attrs["w_quiet"] = length_m * (1.0 + 1.55 * noise_penalty)
-        attrs["w_green"] = length_m * (1.0 + 2.10 * green_penalty)
-        attrs["w_balanced"] = length_m * (1.0 + 1.05 * noise_penalty + 1.20 * green_penalty)
+        # Keep graph-native routing weights intact. Heuristic weights are only
+        # fallbacks when an export does not contain a specific cost function.
+        attrs.setdefault("w_short", length_m)
+        attrs.setdefault("w_quiet", length_m * (1.0 + 1.55 * noise_penalty))
+        attrs.setdefault("w_green", length_m * (1.0 + 2.10 * green_penalty))
+        attrs.setdefault("w_balanced", length_m * (1.0 + 1.05 * noise_penalty + 1.20 * green_penalty))
+        attrs.setdefault("w_accessible", attrs.get("w_balanced", length_m))
 
-        # v1.1 tuned weights recomputed from refreshed environmental metrics.
-        attrs["w_quiet_v11"] = length_m * (1.0 + 1.75 * noise_penalty)
-        attrs["w_green_v11"] = length_m * (1.0 + 2.60 * green_penalty)
-        attrs["w_balanced_v11"] = length_m * (1.0 + 1.15 * noise_penalty + 1.45 * green_penalty)
+        attrs.setdefault("w_quiet_v11", length_m * (1.0 + 1.75 * noise_penalty))
+        attrs.setdefault("w_green_v11", length_m * (1.0 + 2.60 * green_penalty))
+        attrs.setdefault("w_balanced_v11", length_m * (1.0 + 1.15 * noise_penalty + 1.45 * green_penalty))
 
 
 @lru_cache(maxsize=1)
@@ -514,18 +516,21 @@ def _route_metrics(graph: nx.Graph, node_list: list[tuple[float, float]]) -> tup
         if noise is not None:
             if noise <= 1.5:
                 noise = 35.0 + noise * 50.0
-            noise_weighted_sum += float(noise) * seg_len
+            noise_weighted_sum += float(noise) ** 1.08 * seg_len
             noise_total_len += seg_len
 
         if green is not None:
             if green > 1.0:
                 green = green / 100.0
-            green_weighted_sum += float(_clamp(green, 0.0, 1.0)) * seg_len
+            green_weighted_sum += float(_clamp(green, 0.0, 1.0)) ** 1.8 * seg_len
             green_total_len += seg_len
 
     avg_noise = (noise_weighted_sum / noise_total_len) if noise_total_len > 0 else None
     avg_green = (green_weighted_sum / green_total_len) if green_total_len > 0 else None
-    return float(avg_noise) if avg_noise is not None else None, float(avg_green) if avg_green is not None else None
+    noise_value = float(avg_noise) if avg_noise is not None else None
+    if noise_value is not None:
+        noise_value = _clamp(noise_value, 35.0, 85.0)
+    return noise_value, float(avg_green) if avg_green is not None else None
 
 
 def _path_geometry_key(graph: nx.Graph, node_list: list[tuple[float, float]]) -> tuple[tuple[float, float], ...]:
