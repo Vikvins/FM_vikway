@@ -258,9 +258,12 @@ def _estimate_noise_db(
     rail_index: SpatialIndex | None,
 ) -> tuple[float, float]:
     existing = _first_numeric(attrs, NOISE_ATTR_CANDIDATES)
-    if existing is not None and existing > 1.5:
-        noise_db = _clamp(existing, 35.0, 85.0)
-        return noise_db, _clamp((noise_db - 35.0) / 50.0, 0.0, 1.0)
+    existing_db: float | None = None
+    if existing is not None:
+        if existing <= 1.5:
+            existing_db = 35.0 + _clamp(existing, 0.0, 1.0) * 50.0
+        else:
+            existing_db = _clamp(existing, 35.0, 85.0)
 
     highway = _normalize_highway(attrs.get("highway"))
     lanes = _parse_float(attrs.get("lanes"), default=1.0)
@@ -279,7 +282,13 @@ def _estimate_noise_db(
         except Exception:
             rail_component = 0.0
 
-    noise_db = _clamp(35.0 + road_component + lanes_component + speed_component + rail_component, 35.0, 85.0)
+    heuristic_db = _clamp(35.0 + road_component + lanes_component + speed_component + rail_component, 35.0, 85.0)
+    if existing_db is None:
+        noise_db = heuristic_db
+    else:
+        # Exported noise attrs may be coarse and nearly flat. Keep them only as a
+        # weak prior and let the street/rail heuristic provide most of the variance.
+        noise_db = 0.30 * existing_db + 0.70 * heuristic_db
     noise_norm = _clamp((noise_db - 35.0) / 50.0, 0.0, 1.0)
     return noise_db, noise_norm
 
@@ -298,25 +307,29 @@ def _estimate_green_score(
             existing_score = _clamp(existing, 0.0, 1.0)
 
     highway = _normalize_highway(attrs.get("highway"))
-    score = 0.14 + GREEN_HIGHWAY_BONUS.get(highway, 0.0)
+    score = 0.08 + GREEN_HIGHWAY_BONUS.get(highway, 0.0)
     proximity_score = score
 
     if green_index is not None:
         try:
             close_5_geoms = _query_geometries(green_index, edge_line.buffer(5.0))
             close_15_geoms = _query_geometries(green_index, edge_line.buffer(15.0))
-            close_40_geoms = _query_geometries(green_index, edge_line.buffer(40.0))
+            close_30_geoms = _query_geometries(green_index, edge_line.buffer(30.0))
+            close_60_geoms = _query_geometries(green_index, edge_line.buffer(60.0))
 
             close_5 = len(close_5_geoms)
             close_15 = len(close_15_geoms)
-            close_40 = len(close_40_geoms)
+            close_30 = len(close_30_geoms)
+            close_60 = len(close_60_geoms)
 
             if close_5 > 0:
-                proximity_score += 0.42
+                proximity_score += 0.48
             if close_15 > 0:
-                proximity_score += 0.24
-            if close_40 > 0:
-                proximity_score += 0.12
+                proximity_score += 0.28
+            if close_30 > 0:
+                proximity_score += 0.16
+            if close_60 > 0:
+                proximity_score += 0.08
 
             # Dense clusters of green polygons should matter more than a single hit.
             proximity_score += min(close_15, 4) * 0.04
@@ -342,9 +355,8 @@ def _estimate_green_score(
     if existing_score is None:
         return _clamp(proximity_score, 0.0, 1.0)
 
-    # Existing edge attributes can be noisy/coarse; proximity to mapped green
-    # areas should dominate when the route actually borders a park.
-    combined = max(proximity_score, existing_score * 0.55 + proximity_score * 0.45)
+    # Treat existing attrs as a weak prior; green proximity should dominate.
+    combined = 0.20 * existing_score + 0.80 * proximity_score
     return _clamp(combined, 0.0, 1.0)
 
 
@@ -367,22 +379,18 @@ def _enrich_graph_with_environment(graph: nx.Graph, export_dir: Path) -> None:
         attrs["noise_norm"] = noise_norm
         attrs["green_score"] = green_score
 
-        if "w_short" not in attrs:
-            attrs["w_short"] = length_m
-        if "w_quiet" not in attrs:
-            attrs["w_quiet"] = length_m * (1.0 + 1.2 * noise_norm)
-        if "w_green" not in attrs:
-            attrs["w_green"] = length_m * (1.0 + 1.2 * (1.0 - green_score))
-        if "w_balanced" not in attrs:
-            attrs["w_balanced"] = length_m * (1.0 + 0.8 * noise_norm + 0.8 * (1.0 - green_score))
+        green_penalty = (1.0 - green_score) ** 2
+        noise_penalty = noise_norm ** 1.15
 
-        # Preserve calibrated v1.1 weights from exported artifacts when they exist.
-        if "w_quiet_v11" not in attrs:
-            attrs["w_quiet_v11"] = length_m * (1.0 + 1.32 * noise_norm)
-        if "w_green_v11" not in attrs:
-            attrs["w_green_v11"] = length_m * (1.0 + 1.34 * (1.0 - green_score))
-        if "w_balanced_v11" not in attrs:
-            attrs["w_balanced_v11"] = length_m * (1.0 + 0.90 * noise_norm + 0.92 * (1.0 - green_score))
+        attrs["w_short"] = length_m
+        attrs["w_quiet"] = length_m * (1.0 + 1.55 * noise_penalty)
+        attrs["w_green"] = length_m * (1.0 + 2.10 * green_penalty)
+        attrs["w_balanced"] = length_m * (1.0 + 1.05 * noise_penalty + 1.20 * green_penalty)
+
+        # v1.1 tuned weights recomputed from refreshed environmental metrics.
+        attrs["w_quiet_v11"] = length_m * (1.0 + 1.75 * noise_penalty)
+        attrs["w_green_v11"] = length_m * (1.0 + 2.60 * green_penalty)
+        attrs["w_balanced_v11"] = length_m * (1.0 + 1.15 * noise_penalty + 1.45 * green_penalty)
 
 
 @lru_cache(maxsize=1)
