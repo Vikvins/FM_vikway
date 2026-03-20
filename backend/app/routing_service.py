@@ -527,6 +527,84 @@ def _compute_paths(
     requested_mode: Mode,
     include_alternatives: bool,
 ) -> dict[Mode, list[tuple[float, float]]]:
+    def edge_key(a: tuple[float, float], b: tuple[float, float]) -> tuple[tuple[float, float], tuple[float, float]]:
+        return (a, b) if a <= b else (b, a)
+
+    def path_edges(node_list: list[tuple[float, float]]) -> set[tuple[tuple[float, float], tuple[float, float]]]:
+        return {edge_key(a, b) for a, b in zip(node_list[:-1], node_list[1:])}
+
+    def overlap_ratio(
+        edges_a: set[tuple[tuple[float, float], tuple[float, float]]],
+        edges_b: set[tuple[tuple[float, float], tuple[float, float]]],
+    ) -> float:
+        if not edges_a or not edges_b:
+            return 0.0
+        return len(edges_a & edges_b) / float(min(len(edges_a), len(edges_b)))
+
+    def base_weight_for_mode(mode: Mode) -> str | None:
+        return _pick_weight_key(graph, mode)
+
+    def build_weight(
+        mode: Mode,
+        penalized_edges: set[tuple[tuple[float, float], tuple[float, float]]] | None = None,
+        penalty_factor: float = 0.0,
+    ) -> str | Any | None:
+        weight_key = base_weight_for_mode(mode)
+
+        if penalized_edges:
+            def weight_fn(u: Any, v: Any, attrs: dict[str, Any]) -> float:
+                if weight_key is None:
+                    base = float(attrs.get("length_m", attrs.get("weight", 1.0)))
+                else:
+                    base = float(attrs.get(weight_key, attrs.get("length_m", 1.0)))
+                if edge_key(u, v) in penalized_edges:
+                    base += float(attrs.get("length_m", base)) * penalty_factor
+                return base
+
+            return weight_fn
+
+        return weight_key
+
+    def candidate_paths_for_mode(
+        mode: Mode,
+        penalized_edges: set[tuple[tuple[float, float], tuple[float, float]]] | None = None,
+        penalty_factor: float = 0.0,
+        max_candidates: int = 6,
+    ) -> list[list[tuple[float, float]]]:
+        weight = build_weight(mode, penalized_edges=penalized_edges, penalty_factor=penalty_factor)
+        kwargs: dict[str, Any] = {"source": start_node, "target": end_node}
+        if weight is not None:
+            kwargs["weight"] = weight
+
+        candidates: list[list[tuple[float, float]]] = [nx.shortest_path(graph, **kwargs)]
+
+        if include_alternatives:
+            try:
+                iterator = nx.shortest_simple_paths(graph, start_node, end_node, weight=weight)
+                for candidate in iterator:
+                    if candidate in candidates:
+                        continue
+                    candidates.append(candidate)
+                    if len(candidates) >= max_candidates:
+                        break
+            except Exception:
+                pass
+
+        return candidates
+
+    def is_distinct_candidate(
+        geom_key: tuple[tuple[float, float], ...],
+        edge_set: set[tuple[tuple[float, float], tuple[float, float]]],
+        used_geometry_keys: set[tuple[tuple[float, float], ...]],
+        used_path_edges: list[set[tuple[tuple[float, float], tuple[float, float]]]],
+    ) -> bool:
+        if geom_key in used_geometry_keys:
+            return False
+        for existing_edges in used_path_edges:
+            if overlap_ratio(edge_set, existing_edges) >= 0.9:
+                return False
+        return True
+
     modes: list[Mode]
     if include_alternatives:
         modes = [requested_mode] + [m for m in MODE_LABELS.keys() if m != requested_mode]
@@ -534,13 +612,39 @@ def _compute_paths(
         modes = [requested_mode]
 
     paths: dict[Mode, list[tuple[float, float]]] = {}
-    for mode in modes:
-        weight_key = _pick_weight_key(graph, mode)
-        kwargs: dict[str, Any] = {"source": start_node, "target": end_node}
-        if weight_key is not None:
-            kwargs["weight"] = weight_key
+    used_geometry_keys: set[tuple[tuple[float, float], ...]] = set()
+    used_edges: set[tuple[tuple[float, float], tuple[float, float]]] = set()
+    used_path_edges: list[set[tuple[tuple[float, float], tuple[float, float]]]] = []
 
-        paths[mode] = nx.shortest_path(graph, **kwargs)
+    for mode in modes:
+        primary_path = candidate_paths_for_mode(mode, max_candidates=1)[0]
+        path = primary_path
+        geom_key = _path_geometry_key(graph, path)
+        edge_set = path_edges(path)
+
+        # If the route collapses onto an already used geometry, penalize overlap
+        # to force a distinct alternative when the graph allows it.
+        if include_alternatives and not is_distinct_candidate(geom_key, edge_set, used_geometry_keys, used_path_edges) and used_edges:
+            for penalty_factor in (1.5, 3.0, 6.0, 12.0):
+                for candidate in candidate_paths_for_mode(
+                    mode,
+                    penalized_edges=used_edges,
+                    penalty_factor=penalty_factor,
+                ):
+                    candidate_edges = path_edges(candidate)
+                    candidate_key = _path_geometry_key(graph, candidate)
+                    if is_distinct_candidate(candidate_key, candidate_edges, used_geometry_keys, used_path_edges):
+                        path = candidate
+                        geom_key = candidate_key
+                        edge_set = candidate_edges
+                        break
+                if path is not primary_path:
+                    break
+
+        paths[mode] = path
+        used_geometry_keys.add(geom_key)
+        used_path_edges.append(edge_set)
+        used_edges.update(edge_set)
     return paths
 
 
