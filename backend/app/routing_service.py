@@ -376,10 +376,13 @@ def _enrich_graph_with_environment(graph: nx.Graph, export_dir: Path) -> None:
         if "w_balanced" not in attrs:
             attrs["w_balanced"] = length_m * (1.0 + 0.8 * noise_norm + 0.8 * (1.0 - green_score))
 
-        # v1.1: same routing architecture as baseline, slightly stronger eco sensitivity.
-        attrs["w_quiet_v11"] = length_m * (1.0 + 1.32 * noise_norm)
-        attrs["w_green_v11"] = length_m * (1.0 + 1.34 * (1.0 - green_score))
-        attrs["w_balanced_v11"] = length_m * (1.0 + 0.90 * noise_norm + 0.92 * (1.0 - green_score))
+        # Preserve calibrated v1.1 weights from exported artifacts when they exist.
+        if "w_quiet_v11" not in attrs:
+            attrs["w_quiet_v11"] = length_m * (1.0 + 1.32 * noise_norm)
+        if "w_green_v11" not in attrs:
+            attrs["w_green_v11"] = length_m * (1.0 + 1.34 * (1.0 - green_score))
+        if "w_balanced_v11" not in attrs:
+            attrs["w_balanced_v11"] = length_m * (1.0 + 0.90 * noise_norm + 0.92 * (1.0 - green_score))
 
 
 @lru_cache(maxsize=1)
@@ -675,13 +678,26 @@ def _compute_paths(
     used_path_edges: list[set[tuple[tuple[float, float], tuple[float, float]]]] = []
 
     for mode in modes:
-        primary_path = candidate_paths_for_mode(mode, max_candidates=1)[0]
+        own_candidates = candidate_paths_for_mode(mode, max_candidates=10)
+        primary_path = own_candidates[0]
         path = primary_path
         geom_key = _path_geometry_key(graph, path)
         edge_set = path_edges(path)
 
-        # If the route collapses onto an already used geometry, penalize overlap
-        # to force a distinct alternative when the graph allows it.
+        # First try to keep the route faithful to its own mode weights and just pick
+        # the first distinct candidate among the mode's natural best paths.
+        if include_alternatives and used_path_edges:
+            for candidate in own_candidates:
+                candidate_edges = path_edges(candidate)
+                candidate_key = _path_geometry_key(graph, candidate)
+                if is_distinct_candidate(candidate_key, candidate_edges, used_geometry_keys, used_path_edges):
+                    path = candidate
+                    geom_key = candidate_key
+                    edge_set = candidate_edges
+                    break
+
+        # Only if the mode's own best candidates all collapse, penalize overlap
+        # to force a backup alternative.
         if include_alternatives and not is_distinct_candidate(geom_key, edge_set, used_geometry_keys, used_path_edges) and used_edges:
             for penalty_factor in (1.5, 3.0, 6.0, 12.0):
                 for candidate in candidate_paths_for_mode(
