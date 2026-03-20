@@ -290,36 +290,62 @@ def _estimate_green_score(
     green_index: SpatialIndex | None,
 ) -> float:
     existing = _first_numeric(attrs, GREEN_ATTR_CANDIDATES)
+    existing_score: float | None = None
     if existing is not None:
         if existing > 1.0:
-            return _clamp(existing / 100.0, 0.0, 1.0)
-        return _clamp(existing, 0.0, 1.0)
+            existing_score = _clamp(existing / 100.0, 0.0, 1.0)
+        else:
+            existing_score = _clamp(existing, 0.0, 1.0)
 
     highway = _normalize_highway(attrs.get("highway"))
-    score = 0.20 + GREEN_HIGHWAY_BONUS.get(highway, 0.0)
+    score = 0.14 + GREEN_HIGHWAY_BONUS.get(highway, 0.0)
+    proximity_score = score
 
     if green_index is not None:
         try:
-            close_10 = len(_query_geometries(green_index, edge_line.buffer(10.0)))
-            close_25 = len(_query_geometries(green_index, edge_line.buffer(25.0)))
-            close_50 = len(_query_geometries(green_index, edge_line.buffer(50.0)))
+            close_5_geoms = _query_geometries(green_index, edge_line.buffer(5.0))
+            close_15_geoms = _query_geometries(green_index, edge_line.buffer(15.0))
+            close_40_geoms = _query_geometries(green_index, edge_line.buffer(40.0))
 
-            if close_10 > 0:
-                score += 0.28
-            if close_25 > 0:
-                score += 0.20
-            if close_50 > 0:
-                score += 0.12
+            close_5 = len(close_5_geoms)
+            close_15 = len(close_15_geoms)
+            close_40 = len(close_40_geoms)
 
-            # Extra small boost for dense green surroundings.
-            score += min(close_25, 3) * 0.03
+            if close_5 > 0:
+                proximity_score += 0.42
+            if close_15 > 0:
+                proximity_score += 0.24
+            if close_40 > 0:
+                proximity_score += 0.12
+
+            # Dense clusters of green polygons should matter more than a single hit.
+            proximity_score += min(close_15, 4) * 0.04
+
+            # If the edge runs directly along/through a green polygon, boost it harder.
+            direct_green_overlap = 0.0
+            for geom in close_5_geoms:
+                try:
+                    overlap_area = edge_line.buffer(3.0).intersection(geom).area
+                    if overlap_area > direct_green_overlap:
+                        direct_green_overlap = overlap_area
+                except Exception:
+                    continue
+
+            if direct_green_overlap > 0:
+                proximity_score += 0.12
         except Exception:
             pass
 
     if attrs.get("lit") in ("no", False):
-        score += 0.05
+        proximity_score += 0.05
 
-    return _clamp(score, 0.0, 1.0)
+    if existing_score is None:
+        return _clamp(proximity_score, 0.0, 1.0)
+
+    # Existing edge attributes can be noisy/coarse; proximity to mapped green
+    # areas should dominate when the route actually borders a park.
+    combined = max(proximity_score, existing_score * 0.55 + proximity_score * 0.45)
+    return _clamp(combined, 0.0, 1.0)
 
 
 def _enrich_graph_with_environment(graph: nx.Graph, export_dir: Path) -> None:
