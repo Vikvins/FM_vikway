@@ -36,9 +36,9 @@ MODE_COLORS: dict[Mode, str] = {
 
 MODE_WEIGHT_CANDIDATES: dict[Mode, list[str]] = {
     "shortest": ["w_short", "weight", "length_m"],
-    "quiet": ["w_quiet", "w_quiet_v11", "w_noise", "weight"],
-    "green": ["w_green", "w_green_v11", "weight"],
-    "balanced": ["w_accessible", "w_balanced", "w_balanced_v11", "weight", "w_short"],
+    "quiet": ["w_quiet_v11", "w_quiet", "w_noise", "weight"],
+    "green": ["w_green_v11", "w_green", "weight"],
+    "balanced": ["w_balanced_v11", "w_balanced", "w_accessible", "weight", "w_short"],
 }
 
 NOISE_ATTR_CANDIDATES = [
@@ -258,12 +258,9 @@ def _estimate_noise_db(
     rail_index: SpatialIndex | None,
 ) -> tuple[float, float]:
     existing = _first_numeric(attrs, NOISE_ATTR_CANDIDATES)
-    existing_db: float | None = None
-    if existing is not None:
-        if existing <= 1.5:
-            existing_db = 35.0 + _clamp(existing, 0.0, 1.0) * 50.0
-        else:
-            existing_db = _clamp(existing, 35.0, 85.0)
+    if existing is not None and existing > 1.5:
+        noise_db = _clamp(existing, 35.0, 85.0)
+        return noise_db, _clamp((noise_db - 35.0) / 50.0, 0.0, 1.0)
 
     highway = _normalize_highway(attrs.get("highway"))
     lanes = _parse_float(attrs.get("lanes"), default=1.0)
@@ -282,13 +279,7 @@ def _estimate_noise_db(
         except Exception:
             rail_component = 0.0
 
-    heuristic_db = _clamp(35.0 + road_component + lanes_component + speed_component + rail_component, 35.0, 85.0)
-    if existing_db is None:
-        noise_db = heuristic_db
-    else:
-        # Exported noise attrs may be coarse and nearly flat. Keep them only as a
-        # weak prior and let the street/rail heuristic provide most of the variance.
-        noise_db = 0.30 * existing_db + 0.70 * heuristic_db
+    noise_db = _clamp(35.0 + road_component + lanes_component + speed_component + rail_component, 35.0, 85.0)
     noise_norm = _clamp((noise_db - 35.0) / 50.0, 0.0, 1.0)
     return noise_db, noise_norm
 
@@ -299,65 +290,36 @@ def _estimate_green_score(
     green_index: SpatialIndex | None,
 ) -> float:
     existing = _first_numeric(attrs, GREEN_ATTR_CANDIDATES)
-    existing_score: float | None = None
     if existing is not None:
         if existing > 1.0:
-            existing_score = _clamp(existing / 100.0, 0.0, 1.0)
-        else:
-            existing_score = _clamp(existing, 0.0, 1.0)
+            return _clamp(existing / 100.0, 0.0, 1.0)
+        return _clamp(existing, 0.0, 1.0)
 
     highway = _normalize_highway(attrs.get("highway"))
-    score = 0.08 + GREEN_HIGHWAY_BONUS.get(highway, 0.0)
-    proximity_score = score
+    score = 0.20 + GREEN_HIGHWAY_BONUS.get(highway, 0.0)
 
     if green_index is not None:
         try:
-            close_5_geoms = _query_geometries(green_index, edge_line.buffer(5.0))
-            close_15_geoms = _query_geometries(green_index, edge_line.buffer(15.0))
-            close_30_geoms = _query_geometries(green_index, edge_line.buffer(30.0))
-            close_60_geoms = _query_geometries(green_index, edge_line.buffer(60.0))
+            close_10 = len(_query_geometries(green_index, edge_line.buffer(10.0)))
+            close_25 = len(_query_geometries(green_index, edge_line.buffer(25.0)))
+            close_50 = len(_query_geometries(green_index, edge_line.buffer(50.0)))
 
-            close_5 = len(close_5_geoms)
-            close_15 = len(close_15_geoms)
-            close_30 = len(close_30_geoms)
-            close_60 = len(close_60_geoms)
+            if close_10 > 0:
+                score += 0.28
+            if close_25 > 0:
+                score += 0.20
+            if close_50 > 0:
+                score += 0.12
 
-            if close_5 > 0:
-                proximity_score += 0.48
-            if close_15 > 0:
-                proximity_score += 0.28
-            if close_30 > 0:
-                proximity_score += 0.16
-            if close_60 > 0:
-                proximity_score += 0.08
-
-            # Dense clusters of green polygons should matter more than a single hit.
-            proximity_score += min(close_15, 4) * 0.04
-
-            # If the edge runs directly along/through a green polygon, boost it harder.
-            direct_green_overlap = 0.0
-            for geom in close_5_geoms:
-                try:
-                    overlap_area = edge_line.buffer(3.0).intersection(geom).area
-                    if overlap_area > direct_green_overlap:
-                        direct_green_overlap = overlap_area
-                except Exception:
-                    continue
-
-            if direct_green_overlap > 0:
-                proximity_score += 0.12
+            # Extra small boost for dense green surroundings.
+            score += min(close_25, 3) * 0.03
         except Exception:
             pass
 
     if attrs.get("lit") in ("no", False):
-        proximity_score += 0.05
+        score += 0.05
 
-    if existing_score is None:
-        return _clamp(proximity_score, 0.0, 1.0)
-
-    # Treat existing attrs as a weak prior; green proximity should dominate.
-    combined = 0.20 * existing_score + 0.80 * proximity_score
-    return _clamp(combined, 0.0, 1.0)
+    return _clamp(score, 0.0, 1.0)
 
 
 def _enrich_graph_with_environment(graph: nx.Graph, export_dir: Path) -> None:
@@ -379,20 +341,19 @@ def _enrich_graph_with_environment(graph: nx.Graph, export_dir: Path) -> None:
         attrs["noise_norm"] = noise_norm
         attrs["green_score"] = green_score
 
-        green_penalty = (1.0 - green_score) ** 2
-        noise_penalty = noise_norm ** 1.15
+        if "w_short" not in attrs:
+            attrs["w_short"] = length_m
+        if "w_quiet" not in attrs:
+            attrs["w_quiet"] = length_m * (1.0 + 1.2 * noise_norm)
+        if "w_green" not in attrs:
+            attrs["w_green"] = length_m * (1.0 + 1.2 * (1.0 - green_score))
+        if "w_balanced" not in attrs:
+            attrs["w_balanced"] = length_m * (1.0 + 0.8 * noise_norm + 0.8 * (1.0 - green_score))
 
-        # Keep graph-native routing weights intact. Heuristic weights are only
-        # fallbacks when an export does not contain a specific cost function.
-        attrs.setdefault("w_short", length_m)
-        attrs.setdefault("w_quiet", length_m * (1.0 + 1.55 * noise_penalty))
-        attrs.setdefault("w_green", length_m * (1.0 + 2.10 * green_penalty))
-        attrs.setdefault("w_balanced", length_m * (1.0 + 1.05 * noise_penalty + 1.20 * green_penalty))
-        attrs.setdefault("w_accessible", attrs.get("w_balanced", length_m))
-
-        attrs.setdefault("w_quiet_v11", length_m * (1.0 + 1.75 * noise_penalty))
-        attrs.setdefault("w_green_v11", length_m * (1.0 + 2.60 * green_penalty))
-        attrs.setdefault("w_balanced_v11", length_m * (1.0 + 1.15 * noise_penalty + 1.45 * green_penalty))
+        # v1.1: same routing architecture as baseline, slightly stronger eco sensitivity.
+        attrs["w_quiet_v11"] = length_m * (1.0 + 1.32 * noise_norm)
+        attrs["w_green_v11"] = length_m * (1.0 + 1.34 * (1.0 - green_score))
+        attrs["w_balanced_v11"] = length_m * (1.0 + 0.90 * noise_norm + 0.92 * (1.0 - green_score))
 
 
 @lru_cache(maxsize=1)
@@ -516,21 +477,18 @@ def _route_metrics(graph: nx.Graph, node_list: list[tuple[float, float]]) -> tup
         if noise is not None:
             if noise <= 1.5:
                 noise = 35.0 + noise * 50.0
-            noise_weighted_sum += float(noise) ** 1.08 * seg_len
+            noise_weighted_sum += float(noise) * seg_len
             noise_total_len += seg_len
 
         if green is not None:
             if green > 1.0:
                 green = green / 100.0
-            green_weighted_sum += float(_clamp(green, 0.0, 1.0)) ** 1.8 * seg_len
+            green_weighted_sum += float(_clamp(green, 0.0, 1.0)) * seg_len
             green_total_len += seg_len
 
     avg_noise = (noise_weighted_sum / noise_total_len) if noise_total_len > 0 else None
     avg_green = (green_weighted_sum / green_total_len) if green_total_len > 0 else None
-    noise_value = float(avg_noise) if avg_noise is not None else None
-    if noise_value is not None:
-        noise_value = _clamp(noise_value, 35.0, 85.0)
-    return noise_value, float(avg_green) if avg_green is not None else None
+    return float(avg_noise) if avg_noise is not None else None, float(avg_green) if avg_green is not None else None
 
 
 def _path_geometry_key(graph: nx.Graph, node_list: list[tuple[float, float]]) -> tuple[tuple[float, float], ...]:
@@ -562,38 +520,6 @@ def _dedupe_paths(
     return [(item["modes"], item["path"]) for item in grouped.values()]
 
 
-def _metric_delta(a: float | None, b: float | None) -> float:
-    if a is None or b is None:
-        return 0.0
-    return abs(float(a) - float(b))
-
-
-def _is_meaningfully_distinct_route(candidate: RouteInfo, existing: RouteInfo) -> bool:
-    length_delta_ratio = abs(candidate.length_m - existing.length_m) / max(existing.length_m, 1.0)
-    noise_delta = _metric_delta(candidate.avg_noise, existing.avg_noise)
-    green_delta = _metric_delta(candidate.avg_green, existing.avg_green)
-
-    return (
-        length_delta_ratio >= 0.08
-        or noise_delta >= 0.5
-        or green_delta >= 0.03
-    )
-
-
-def _filter_metric_duplicates(routes: list[RouteInfo]) -> list[RouteInfo]:
-    filtered: list[RouteInfo] = []
-
-    for route in routes:
-        if not filtered:
-            filtered.append(route)
-            continue
-
-        if any(_is_meaningfully_distinct_route(route, existing) for existing in filtered):
-            filtered.append(route)
-
-    return filtered
-
-
 def _compute_paths(
     graph: nx.Graph,
     start_node: tuple[float, float],
@@ -601,84 +527,6 @@ def _compute_paths(
     requested_mode: Mode,
     include_alternatives: bool,
 ) -> dict[Mode, list[tuple[float, float]]]:
-    def edge_key(a: tuple[float, float], b: tuple[float, float]) -> tuple[tuple[float, float], tuple[float, float]]:
-        return (a, b) if a <= b else (b, a)
-
-    def path_edges(node_list: list[tuple[float, float]]) -> set[tuple[tuple[float, float], tuple[float, float]]]:
-        return {edge_key(a, b) for a, b in zip(node_list[:-1], node_list[1:])}
-
-    def overlap_ratio(
-        edges_a: set[tuple[tuple[float, float], tuple[float, float]]],
-        edges_b: set[tuple[tuple[float, float], tuple[float, float]]],
-    ) -> float:
-        if not edges_a or not edges_b:
-            return 0.0
-        return len(edges_a & edges_b) / float(min(len(edges_a), len(edges_b)))
-
-    def base_weight_for_mode(mode: Mode) -> str | None:
-        return _pick_weight_key(graph, mode)
-
-    def build_weight(
-        mode: Mode,
-        penalized_edges: set[tuple[tuple[float, float], tuple[float, float]]] | None = None,
-        penalty_factor: float = 0.0,
-    ) -> str | Any | None:
-        weight_key = base_weight_for_mode(mode)
-
-        if penalized_edges:
-            def weight_fn(u: Any, v: Any, attrs: dict[str, Any]) -> float:
-                if weight_key is None:
-                    base = float(attrs.get("length_m", attrs.get("weight", 1.0)))
-                else:
-                    base = float(attrs.get(weight_key, attrs.get("length_m", 1.0)))
-                if edge_key(u, v) in penalized_edges:
-                    base += float(attrs.get("length_m", base)) * penalty_factor
-                return base
-
-            return weight_fn
-
-        return weight_key
-
-    def candidate_paths_for_mode(
-        mode: Mode,
-        penalized_edges: set[tuple[tuple[float, float], tuple[float, float]]] | None = None,
-        penalty_factor: float = 0.0,
-        max_candidates: int = 6,
-    ) -> list[list[tuple[float, float]]]:
-        weight = build_weight(mode, penalized_edges=penalized_edges, penalty_factor=penalty_factor)
-        kwargs: dict[str, Any] = {"source": start_node, "target": end_node}
-        if weight is not None:
-            kwargs["weight"] = weight
-
-        candidates: list[list[tuple[float, float]]] = [nx.shortest_path(graph, **kwargs)]
-
-        if include_alternatives:
-            try:
-                iterator = nx.shortest_simple_paths(graph, start_node, end_node, weight=weight)
-                for candidate in iterator:
-                    if candidate in candidates:
-                        continue
-                    candidates.append(candidate)
-                    if len(candidates) >= max_candidates:
-                        break
-            except Exception:
-                pass
-
-        return candidates
-
-    def is_distinct_candidate(
-        geom_key: tuple[tuple[float, float], ...],
-        edge_set: set[tuple[tuple[float, float], tuple[float, float]]],
-        used_geometry_keys: set[tuple[tuple[float, float], ...]],
-        used_path_edges: list[set[tuple[tuple[float, float], tuple[float, float]]]],
-    ) -> bool:
-        if geom_key in used_geometry_keys:
-            return False
-        for existing_edges in used_path_edges:
-            if overlap_ratio(edge_set, existing_edges) >= 0.9:
-                return False
-        return True
-
     modes: list[Mode]
     if include_alternatives:
         modes = [requested_mode] + [m for m in MODE_LABELS.keys() if m != requested_mode]
@@ -686,52 +534,13 @@ def _compute_paths(
         modes = [requested_mode]
 
     paths: dict[Mode, list[tuple[float, float]]] = {}
-    used_geometry_keys: set[tuple[tuple[float, float], ...]] = set()
-    used_edges: set[tuple[tuple[float, float], tuple[float, float]]] = set()
-    used_path_edges: list[set[tuple[tuple[float, float], tuple[float, float]]]] = []
-
     for mode in modes:
-        own_candidates = candidate_paths_for_mode(mode, max_candidates=10)
-        primary_path = own_candidates[0]
-        path = primary_path
-        geom_key = _path_geometry_key(graph, path)
-        edge_set = path_edges(path)
+        weight_key = _pick_weight_key(graph, mode)
+        kwargs: dict[str, Any] = {"source": start_node, "target": end_node}
+        if weight_key is not None:
+            kwargs["weight"] = weight_key
 
-        # First try to keep the route faithful to its own mode weights and just pick
-        # the first distinct candidate among the mode's natural best paths.
-        if include_alternatives and used_path_edges:
-            for candidate in own_candidates:
-                candidate_edges = path_edges(candidate)
-                candidate_key = _path_geometry_key(graph, candidate)
-                if is_distinct_candidate(candidate_key, candidate_edges, used_geometry_keys, used_path_edges):
-                    path = candidate
-                    geom_key = candidate_key
-                    edge_set = candidate_edges
-                    break
-
-        # Only if the mode's own best candidates all collapse, penalize overlap
-        # to force a backup alternative.
-        if include_alternatives and not is_distinct_candidate(geom_key, edge_set, used_geometry_keys, used_path_edges) and used_edges:
-            for penalty_factor in (1.5, 3.0, 6.0, 12.0):
-                for candidate in candidate_paths_for_mode(
-                    mode,
-                    penalized_edges=used_edges,
-                    penalty_factor=penalty_factor,
-                ):
-                    candidate_edges = path_edges(candidate)
-                    candidate_key = _path_geometry_key(graph, candidate)
-                    if is_distinct_candidate(candidate_key, candidate_edges, used_geometry_keys, used_path_edges):
-                        path = candidate
-                        geom_key = candidate_key
-                        edge_set = candidate_edges
-                        break
-                if path is not primary_path:
-                    break
-
-        paths[mode] = path
-        used_geometry_keys.add(geom_key)
-        used_path_edges.append(edge_set)
-        used_edges.update(edge_set)
+        paths[mode] = nx.shortest_path(graph, **kwargs)
     return paths
 
 
@@ -800,7 +609,6 @@ def build_routes(request: RouteRequest) -> RouteResponse:
         )
 
     route_infos.sort(key=lambda r: (not r.selected, r.eta_min))
-    route_infos = _filter_metric_duplicates(route_infos)
 
     snapped_start_lat, snapped_start_lon = m_to_latlon(*start_node)
     snapped_end_lat, snapped_end_lon = m_to_latlon(*end_node)
